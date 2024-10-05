@@ -1,3 +1,5 @@
+#include "MPU6050_6Axis_MotionApps20.h"
+#include "esp32-hal-gpio.h"
 #include <Arduino.h>
 #include <MPU6050.h>
 #include <Wire.h>
@@ -18,13 +20,20 @@ MPU6050 mpu(MPU6050_I2C);
 bool is_connected = false;
 bool is_dmp_ready = false;
 
-uint8_t buffer[64];
+uint8_t packet[42];
+uint16_t packet_size;
 
 Quaternion q;
 VectorInt16 av;
 VectorInt16 aa;
-int16_t gravity[3];
-float ypr[3];
+
+float gyro_unit;
+float accel_unit;
+float av_si[3];
+float aa_si[3];
+
+float angle_accel[3];
+float angle_gyro[3];
 
 // DRV8835 configurations
 const int PWM_FREQUENCY = 50000;
@@ -37,6 +46,7 @@ const unsigned IN2PH_PIN = 0;
 int8_t left_speed = 0;
 int8_t right_speed = 0;
 
+void get_angle_from_accel(float aa_si[3], float *angle);
 void drive_motor(uint8_t channel, uint8_t pin, int8_t speed);
 
 void setup() {
@@ -67,6 +77,37 @@ void setup() {
 
   mpu.CalibrateAccel();
   mpu.CalibrateGyro();
+
+  mpu.dmpInitialize();
+  mpu.setDMPEnabled(true);
+  packet_size = mpu.dmpGetFIFOPacketSize();
+
+  int gyro_range = mpu.getFullScaleGyroRange();
+  gyro_unit = 0.0;
+  if (gyro_range == 0) {
+    gyro_unit = 250.0;
+  } else if (gyro_range == 1) {
+    gyro_unit = 500.0;
+  } else if (gyro_range == 2) {
+    gyro_unit = 1000.0;
+  } else if (gyro_range == 3) {
+    gyro_unit = 2000.0;
+  }
+  gyro_unit /= 16384.0;
+
+  int accel_range = mpu.getFullScaleAccelRange();
+  accel_unit = 0.0;
+  if (accel_range == 0) {
+    accel_unit = 2.0;
+  } else if (accel_range == 1) {
+    accel_unit = 4.0;
+  } else if (accel_range == 2) {
+    accel_unit = 8.0;
+  } else if (accel_range == 3) {
+    accel_unit = 16.0;
+  }
+  accel_unit /= 16384.0;
+  accel_unit *= 9.8;
 }
 
 void loop() {
@@ -74,22 +115,45 @@ void loop() {
     Serial.println("MPU-6050 not available");
   }
 
-  int gyro_range = mpu.getFullScaleGyroRange();
-  int accel_range = mpu.getFullScaleAccelRange();
+  if (mpu.dmpPacketAvailable()) {
+    mpu.dmpGetCurrentFIFOPacket(packet);
 
-  int16_t vx, vy, vz;
-  int16_t ax, ay, az;
-  mpu.getRotation(&vx, &vy, &vz);
-  mpu.getAcceleration(&ax, &ay, &az);
-  Serial.printf("av\t%d\t%d\t\%d\n", vx, vy, vz);
-  Serial.printf("aa\t%d\t%d\t\%d\n", ax, ay, az);
+    mpu.dmpGetGyro(&av, packet);
+    mpu.dmpGetAccel(&aa, packet);
 
-  left_speed = int8_t(ax >> 8);
-  right_speed = -int8_t(ax >> 8);
+    // degree per sec
+    av_si[0] = float(av.x) * gyro_unit;
+    av_si[1] = float(av.y) * gyro_unit;
+    av_si[2] = float(av.z) * gyro_unit;
+    get_angle_from_accel(aa_si, angle_accel);
 
-  drive_motor(0, IN1PH_PIN, left_speed);
-  drive_motor(1, IN2PH_PIN, right_speed);
-  delay(1000);
+    // meter per sec^2
+    aa_si[0] = float(aa.x) * accel_unit;
+    aa_si[1] = float(aa.y) * accel_unit;
+    aa_si[2] = float(aa.z) * accel_unit;
+    get_angle_from_accel(aa_si, angle_accel);
+
+    Serial.printf("v = (%f, %f, %f)\n", av_si[0], av_si[1], av_si[2]);
+    Serial.printf("a = (%f, %f, %f)\n", aa_si[0], aa_si[1], aa_si[2]);
+    Serial.printf("angle(radian) = (%f, %f, %f)\n", angle_accel[0],
+                  angle_accel[1], angle_accel[2]);
+    Serial.printf("angle(radian) = (%f, %f, %f)\n", angle_gyro[0],
+                  angle_gyro[1], angle_gyro[2]);
+
+    left_speed = int8_t(aa.x >> 6);
+    right_speed = -int8_t(aa.x >> 6);
+    Serial.printf("speed = (%d, %d)\n", left_speed, right_speed);
+
+    drive_motor(0, IN1PH_PIN, left_speed);
+    drive_motor(1, IN2PH_PIN, right_speed);
+  }
+  delay(100);
+}
+
+void get_angle_from_accel(float aa_si[3], float *angle) {
+  angle[0] = atanf(aa_si[0] / sqrtf(aa_si[1] * aa_si[1] + aa_si[2] * aa_si[2]));
+  angle[1] = atanf(aa_si[1] / sqrtf(aa_si[0] * aa_si[0] + aa_si[2] * aa_si[2]));
+  angle[2] = atanf(aa_si[2] / sqrtf(aa_si[1] * aa_si[1] + aa_si[0] * aa_si[0]));
 }
 
 void drive_motor(uint8_t channel, uint8_t pin, int8_t speed) {
